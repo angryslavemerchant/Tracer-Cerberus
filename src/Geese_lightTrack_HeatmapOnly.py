@@ -79,14 +79,6 @@ def make_grid(score_size: int, stride: int, search_size: int):
     return grid_x, grid_y
 
 
-def decode_boxes(reg: np.ndarray, grid_x: np.ndarray, grid_y: np.ndarray) -> np.ndarray:
-    x1 = grid_x - reg[0]
-    y1 = grid_y - reg[1]
-    x2 = grid_x + reg[2]
-    y2 = grid_y + reg[3]
-    return np.stack([x1, y1, x2, y2], axis=-1)
-
-
 _GRID_X, _GRID_Y = make_grid(SCORE_SIZE, STRIDE, SEARCH_SIZE)
 
 
@@ -98,8 +90,6 @@ def compute_psr(score_map: np.ndarray, exclude_radius: int = 2) -> tuple:
     map.  When the target is present, cross-correlation produces a tight
     spike → high PSR.  When the target is absent, the map is flat or noisy
     → low PSR, even if the raw sigmoid peak value looks similar.
-
-    This is why raw sigmoid peak fails as a presence detector but PSR works.
 
     Parameters
     ----------
@@ -129,31 +119,32 @@ def compute_psr(score_map: np.ndarray, exclude_radius: int = 2) -> tuple:
     return float(psr), (peak_r, peak_c)
 
 
-def run_lighttrack(sess, template_tensor: np.ndarray, search_bgr: np.ndarray):
+def run_lighttrack_heatmap(sess, template_tensor: np.ndarray, search_bgr: np.ndarray):
     """
+    Heatmap-only tracking: uses only the cls head response map.
+    Box center is decoded from the peak cell; size is not used here —
+    the caller carries template_size_px forward as the box size.
+
     Returns
     -------
-    best_box  : (x1, y1, x2, y2) in SEARCH_SIZE (256-px) coordinates
+    cx_search : float  — peak center X in SEARCH_SIZE (256-px) coordinates
+    cy_search : float  — peak center Y in SEARCH_SIZE (256-px) coordinates
     psr       : float  — use this to gate tracking / reacquisition
     raw_conf  : float  — raw sigmoid peak value (display only)
     score_map : (16, 16) sigmoid score map
     """
-    search_tensor    = preprocess(search_bgr, SEARCH_SIZE)
-    cls_raw, reg_raw = sess.run(None, {"template": template_tensor,
-                                       "search":   search_tensor})
-    cls_sig          = sigmoid(cls_raw[0, 0]).astype(np.float32)   # (16, 16)
-    reg              = reg_raw[0]                                   # (4, 16, 16)
-    boxes            = decode_boxes(reg, _GRID_X, _GRID_Y)         # (16, 16, 4)
+    search_tensor = preprocess(search_bgr, SEARCH_SIZE)
+    outputs       = sess.run(None, {"template": template_tensor,
+                                    "search":   search_tensor})
+    cls_raw = outputs[0]                                      # ignore reg output
+    cls_sig = sigmoid(cls_raw[0, 0]).astype(np.float32)      # (16, 16)
 
     psr, (peak_r, peak_c) = compute_psr(cls_sig)
+    raw_conf  = float(cls_sig[peak_r, peak_c])
+    cx_search = float(_GRID_X[peak_r, peak_c])
+    cy_search = float(_GRID_Y[peak_r, peak_c])
 
-    # Derive the bbox from the same peak cell used for PSR so they're consistent
-    flat_boxes = boxes.reshape(-1, 4)
-    best_idx   = peak_r * cls_sig.shape[1] + peak_c
-    best_box   = flat_boxes[best_idx]
-    raw_conf   = float(cls_sig[peak_r, peak_c])
-
-    return best_box, psr, raw_conf, cls_sig
+    return cx_search, cy_search, psr, raw_conf, cls_sig
 
 
 # ── Crop helpers ──────────────────────────────────────────────────────────────
@@ -168,27 +159,30 @@ def extract_square_crop(frame: np.ndarray, cx: int, cy: int, size: int):
     half   = size // 2
     ox, oy = cx - half, cy - half
 
-    x1c    = max(0, ox);           y1c = max(0, oy)
-    x2c    = min(w, ox + size);    y2c = min(h, oy + size)
+    x1c    = max(0, ox);                    y1c = max(0, oy)
+    x2c    = max(x1c, min(w, ox + size));   y2c = max(y1c, min(h, oy + size))
 
     crop   = np.zeros((size, size, 3), dtype=np.uint8)
     dst_x  = x1c - ox
     dst_y  = y1c - oy
-    crop[dst_y : dst_y + (y2c - y1c),
-         dst_x : dst_x + (x2c - x1c)] = frame[y1c:y2c, x1c:x2c]
+    rh, rw = y2c - y1c, x2c - x1c
+    if rh > 0 and rw > 0:
+        crop[dst_y : dst_y + rh, dst_x : dst_x + rw] = frame[y1c:y2c, x1c:x2c]
 
     return crop, (ox, oy)
 
 
-def search_box_to_frame(best_box_search, origin, search_size_px):
-    """Map a box from SEARCH_SIZE coords back to frame coords → (x, y, w, h)."""
+def heatmap_center_to_frame(cx_search, cy_search, origin, search_size_px, box_size_px):
+    """
+    Map heatmap peak center (in 256-px search coords) → frame bbox (x, y, w, h).
+    Box size is fixed to box_size_px (template size carried from acquisition).
+    """
     scale  = search_size_px / SEARCH_SIZE
     ox, oy = origin
-    x1 = ox + best_box_search[0] * scale
-    y1 = oy + best_box_search[1] * scale
-    x2 = ox + best_box_search[2] * scale
-    y2 = oy + best_box_search[3] * scale
-    return int(x1), int(y1), int(x2 - x1), int(y2 - y1)
+    cx_frame = ox + cx_search * scale
+    cy_frame = oy + cy_search * scale
+    half = box_size_px // 2
+    return int(cx_frame - half), int(cy_frame - half), box_size_px, box_size_px
 
 
 # ── YOLO helper ───────────────────────────────────────────────────────────────
@@ -221,32 +215,21 @@ def crop_center_square(frame, size=640):
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 YOLO_MODEL        = 'yolo11s.pt'
-LIGHTTRACK_MODEL  = 'lighttrack_cerberus.onnx'
+LIGHTTRACK_MODEL  = 'cerberus_core.onnx'
 CLASSES_TO_DETECT = [14]                # 14 = bird in COCO
 RESOLUTION        = (1280, 720)
 CROP_SIZE         = 640
 
 YOLO_CONF         = 0.25
 
-# ── PSR threshold ─────────────────────────────────────────────────────────────
-# Unlike raw sigmoid, PSR measures peak *sharpness* relative to the rest of
-# the response map.  A flat map (target absent) gives low PSR even when the
-# raw peak value looks fine.  This is the primary lever for presence detection.
-#
-#   < 7   → target likely gone         → reacquire
-#   7–10  → marginal / partial occlusion
-#   > 10  → solid lock
-#
-# Raise PSR_THRESH if you still get false locks; lower it if it drops out on
-# fast motion or partial occlusion.
-
-PSR_THRESH        = 2 #normall 5, testing 0.1
+PSR_THRESH        = 18
 
 # ── Search window ─────────────────────────────────────────────────────────────
-SEARCH_SCALE_INIT  = 2.0    # template_size_px × this  (first acquire)
-SEARCH_SCALE_TRACK = 2.5    # max(tw, th) × this       (adaptive component)
-SEARCH_FLOOR_SCALE = 2.75   # template_size_px × this  (floor — prevents collapse)
-MIN_SEARCH_PX      = 64     # hard absolute floor
+# Search area is set once at acquisition and held constant for the life of the
+# track — no adaptive resizing.  This simplifies the pipeline and avoids the
+# search window expanding/collapsing with bbox noise.
+SEARCH_SCALE_INIT = 2.0    # template_size_px × this  (set at acquire, stays fixed)
+MIN_SEARCH_PX     = 64     # hard absolute floor
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -315,8 +298,6 @@ while True:
             bx, by, bw, bh = bbox
             bcx, bcy       = bx + bw // 2, by + bh // 2
 
-            # Tight template: min(bw, bh) crops inside the detection box,
-            # minimising background bleed into the template embedding
             template_size_px = min(bw, bh)
             tmpl_crop, _     = extract_square_crop(frame, bcx, bcy,
                                                    template_size_px)
@@ -328,13 +309,13 @@ while True:
                                                               search_size_px)
 
             t0 = time.time()
-            best_box, last_psr, last_raw_conf, last_score_map = run_lighttrack(
-                lt_sess, template_tensor, search_crop)
+            cx_s, cy_s, last_psr, last_raw_conf, last_score_map = \
+                run_lighttrack_heatmap(lt_sess, template_tensor, search_crop)
             lt_time = (time.time() - t0) * 1000
 
             if last_psr >= PSR_THRESH:
-                track_bbox = search_box_to_frame(best_box, search_origin,
-                                                 search_size_px)
+                track_bbox = heatmap_center_to_frame(
+                    cx_s, cy_s, search_origin, search_size_px, template_size_px)
                 state = TrackState.TRACKING
                 print(f"Target acquired | PSR={last_psr:.1f} | "
                       f"raw={last_raw_conf:.3f} | "
@@ -348,21 +329,18 @@ while True:
             tcx = tx + tw // 2
             tcy = ty + th // 2
 
-            adaptive_size  = int(max(tw, th) * SEARCH_SCALE_TRACK)
-            floor_size     = int(template_size_px * SEARCH_FLOOR_SCALE)
-            search_size_px = max(adaptive_size, floor_size, MIN_SEARCH_PX)
-
+            # search_size_px is constant — set at acquisition, not updated here
             search_crop, search_origin = extract_square_crop(frame, tcx, tcy,
                                                               search_size_px)
 
             t0 = time.time()
-            best_box, last_psr, last_raw_conf, last_score_map = run_lighttrack(
-                lt_sess, template_tensor, search_crop)
+            cx_s, cy_s, last_psr, last_raw_conf, last_score_map = \
+                run_lighttrack_heatmap(lt_sess, template_tensor, search_crop)
             lt_time = (time.time() - t0) * 1000
 
             if last_psr >= PSR_THRESH:
-                track_bbox = search_box_to_frame(best_box, search_origin,
-                                                 search_size_px)
+                track_bbox = heatmap_center_to_frame(
+                    cx_s, cy_s, search_origin, search_size_px, template_size_px)
             else:
                 print(f"PSR dropped to {last_psr:.1f} — reacquiring")
                 state      = TrackState.REACQUIRING
@@ -389,17 +367,18 @@ while True:
             cv2.COLORMAP_JET)
 
         ox, oy = search_origin
-        x1c = max(0, ox);           y1c = max(0, oy)
-        x2c = min(CROP_SIZE, ox + search_size_px)
-        y2c = min(CROP_SIZE, oy + search_size_px)
+        x1c = max(0, ox);                           y1c = max(0, oy)
+        x2c = max(x1c, min(CROP_SIZE, ox + search_size_px))
+        y2c = max(y1c, min(CROP_SIZE, oy + search_size_px))
         hx1 = x1c - ox;  hy1 = y1c - oy
         hx2 = hx1 + (x2c - x1c)
         hy2 = hy1 + (y2c - y1c)
 
-        roi = annotated[y1c:y2c, x1c:x2c]
-        annotated[y1c:y2c, x1c:x2c] = cv2.addWeighted(
-            roi, 0.6,
-            hmap_colour[hy1:hy2, hx1:hx2], 0.4, 0)
+        if (y2c > y1c) and (x2c > x1c):
+            roi = annotated[y1c:y2c, x1c:x2c]
+            annotated[y1c:y2c, x1c:x2c] = cv2.addWeighted(
+                roi, 0.6,
+                hmap_colour[hy1:hy2, hx1:hx2], 0.4, 0)
 
     # ── Search window box ─────────────────────────────────────────────────────
     if state == TrackState.TRACKING:
@@ -438,8 +417,8 @@ while True:
     frame_count += 1
     fps = frame_count / (time.time() - fps_start)
 
-    # PSR bar at bottom — makes threshold tuning much easier visually
-    psr_clamped = min(max(last_psr, 0.0), 20.0)
+    psr_safe    = last_psr if last_psr == last_psr else 0.0   # replace NaN with 0
+    psr_clamped = min(max(psr_safe, 0.0), 20.0)
     bar_w       = int((psr_clamped / 20.0) * 150)
     bar_color   = (0, 255, 0) if last_psr >= PSR_THRESH else (0, 100, 255)
     cv2.rectangle(annotated, (10, CROP_SIZE - 30),
@@ -467,7 +446,7 @@ while True:
         cv2.putText(annotated, text, (10, 30 + i * 35),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
 
-    cv2.imshow('Goose Tracker (YOLO + LightTrack)', annotated)
+    cv2.imshow('Goose Tracker (Heatmap Only)', annotated)
 
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
