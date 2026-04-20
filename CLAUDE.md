@@ -116,6 +116,38 @@ for info in output_infos:
 - Tested on HailoRT v4.19.0 with Hailo-8 / Hailo-8L (e.g. Raspberry Pi 5 AI HAT)
 - There is no pip-installable `hailo_platform` from PyPI — it ships with the HailoRT runtime `.deb` install
 - Python version must match the available wheel bundled with your HailoRT version
+- `quantized=False, FLOAT32` expects pixel values in **[0, 255]** range, not [0, 1] — the model's calibration params are anchored to uint8 range
+- Input format is **NHWC** `(1, H, W, C)` on Hailo, not NCHW like PyTorch/ONNX
+
+---
+
+## YOLOv8s (Hailo Model Zoo) — Confirmed Behaviour
+
+- HEF: `Models/yolov8s.hef`
+- Input: `yolov8s/input_layer1`, shape `(640, 640, 3)` NHWC
+- Output: `yolov8s/yolov8_nms_postprocess`, NMS baked in
+- Output structure: `results[name]` returns a **list of length 1** (batch), where `result[0]` is a **list of 80 arrays** (one per COCO class), each shaped `(N, 5)` — `[y1, x1, y2, x2, score]` with normalized coords `[0, 1]`
+- Empty arrays `(0, 5)` mean no detections for that class — normal
+
+---
+
+## picamera2 + OpenCV Colour Order (Raspberry Pi 5, imx708_noir)
+
+- `picamera2` with `"RGB888"` format actually stores pixels in **BGR order** in memory on this system (libcamera/PiSP quirk)
+- Display with `cv2.imshow` directly — no conversion needed
+- Convert to RGB before model inference: `cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)`
+- Camera in use: **Camera Module 3 Noir** (`imx708_noir`)
+- Camera is mounted upside-down — use `Transform(hflip=True, vflip=True)` in picamera2 config (ISP handles it for free, ~3ms cheaper than `cv2.ROTATE_180`)
+
+---
+
+## Pipeline Performance (Raspberry Pi 5 + Hailo-8L, YOLOv8s, 1280x720)
+
+- Sustained **~55-65 FPS** headless (no display)
+- `cv2.imshow` + `waitKey` locks to ~30fps via vsync — run display in a separate thread or skip for max throughput
+- Per-step breakdown: capture ~2ms, cvt ~1ms, preprocess ~2ms, infer ~11ms, draw ~1.5ms
+- Input as `uint8` (`quantized=True, UINT8`) vs float32 shows marginal difference — float32 is fine
+- imx708 supports 120fps at 1280x720 — set via `controls={"FrameRate": 120}` in picamera2 config
 
 ---
 
